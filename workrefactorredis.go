@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	_ "expvar"
 	"flag"
@@ -14,9 +15,8 @@ import (
 	"sync"
 	"syscall"
 	//"github.com/go-redis/redis"
-
 	"net/http"
-	_ "net/http/pprof"
+	"runtime"
 	"time"
 
 	"gopkg.in/redis.v4"
@@ -35,10 +35,23 @@ type job struct {
 }
 
 var mu sync.Mutex
-
 var (
 	sema = make(chan struct{}, 1) // a binary semaphore guarding balance
 )
+
+// type Once struct {
+// 	done int32
+// }
+
+// func (o *Once) Do(f func()) {
+// 	if atomic.LoadInt32(&o.done) == 1 {
+// 		return
+// 	}
+// 	// Slow-path.
+// 	if atomic.CompareAndSwapInt32(&o.done, 0, 1) {
+// 		f()
+// 	}
+// }
 
 // func Deposit(amount int) {
 // 	sema <- struct{}{} // acquire token
@@ -83,30 +96,95 @@ func teller(client *redis.Client) {
 	}
 }
 
-func (w worker) process(client *redis.Client, j job) {
-	//mu.Lock()
+var startTime int64
+var runned bool
+
+func (w worker) process(client *redis.Client, taskjob job) error {
+	// mu.Lock()
 	// sema <- struct{}{} // acquire token
-	Deduct(j.amount)
+	///Deduct(j.amount)
 	//amount, _ := client.Get("amount").Int64()
-	balance := Balance()
-	var strBalance string
-	if balance <= 0 {
-		balance = 0
-		strBalance = "0"
-	} else {
-		strBalance = strconv.FormatInt(j.amount, 10)
-		fmt.Println(j.name+"-"+strBalance, string(j.ip), j.amount)
+	///balance := Balance()
+	var decrby func(string, int64, int) error
+	retrytimes := 3
+	ctx, cancelFunc := context.WithDeadline(context.Background(), time.Now().Add(time.Second*1))
+
+	decrby = func(key string, value int64, retrytimes int) error {
+		if value <= 0 {
+			return nil
+		}
+		err := client.Watch(func(tx *redis.Tx) error {
+			var once sync.Once
+			onceBody := func() {
+				fmt.Printf("%.2f抢光!\n", float32(time.Now().UnixNano()-startTime)/1e9)
+			}
+			n, err := tx.Get(key).Int64()
+			if n == 0 {
+				if !runned {
+					once.Do(onceBody)
+					runned = true
+				}
+				//os.Exit(0)
+				return nil
+			}
+			if err != nil && err != redis.Nil {
+				return err
+			}
+			if n-value >= 0 {
+				_, err = tx.MultiExec(func() error {
+					tx.DecrBy(key, value)
+					fmt.Println(strconv.FormatInt(n-value, 10))
+					// tx.Set(key, strconv.FormatInt(n-value, 10), 0)
+					return nil
+				})
+			}
+			strValue := strconv.FormatInt(taskjob.amount, 10)
+			_, err = client.Set(taskjob.name+"-"+strValue, string(taskjob.ip), 0).Result()
+			// if err == nil && n-value >= 0 {
+			// 	fmt.Printf("任务:%s 额度:%d 金额:%d 剩余:%d\n", taskjob.name, n, value, n-value)
+			// }
+			return err
+
+		}, key)
+		if err == redis.TxFailedErr && retrytimes > 0 {
+			retrytimes--
+			time.Sleep(time.Microsecond)
+			return decrby(key, value, retrytimes)
+			// return nil
+		}
+
+		return err
 	}
-	_, err := client.Set(j.name+"-"+strBalance, string(j.ip), 0).Result()
+
+	err := decrby("amount", taskjob.amount, retrytimes)
 	if err != nil {
-		log.Fatalf("write redis error: %s", err.Error())
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		default:
+		}
 	}
+
+	// var strBalance string
+	// if balance <= 0 {
+	// 	balance = 0
+	// 	strBalance = "0"
+	// } else {
+	// 	strBalance = strconv.FormatInt(j.amount, 10)
+	// 	fmt.Println(j.name+"-"+strBalance, string(j.ip), j.amount)
+	// }
+	// _, err := client.Set(j.name+"-"+strBalance, string(j.ip), 0).Result()
+	// if err != nil {
+	// 	log.Fatalf("write redis error: %s", err.Error())
+	// }
 	// fmt.Printf("worker%d: completed %s!\n", w.id, j.name+"-"+strBalance)
 	defer func() {
-		//	mu.Unlock()
+		// mu.Unlock()
+		cancelFunc()
+		taskjob.done <- struct{}{}
 		// <-sema // release token
-		j.done <- struct{}{}
 	}()
+	return err
 }
 
 var textBufferPool = sync.Pool{
@@ -137,27 +215,32 @@ func getUUID() (uuid string) {
 	return
 }
 
-func requestHandler(jobCh chan job, c echo.Context) error {
+func requestHandler(jobCh chan<- job, c echo.Context) error {
 	// Create Job and push the work onto the jobCh.
 	done := doneChanPool.Get().(chan struct{})
-
-	job := job{[]byte(c.Request().RemoteAddress()), getUUID(), getRand(), 0, done}
-	go func() {
+	taskjob := job{[]byte(c.Request().RemoteAddress()), getUUID(), getRand(), 0, done}
+	ctx, cancelFunc := context.WithDeadline(context.Background(), time.Now().Add(time.Second*1))
+	go func(taskjob job, ctx context.Context) {
 		//fmt.Printf("added: %s %s\n", job.name, job.duration)
-		jobCh <- job
-	}()
+		jobCh <- taskjob
+	}(taskjob, ctx)
+
 	for {
 		select {
-		case <-job.done:
+		case <-taskjob.done:
 			c.Response().WriteHeader(http.StatusCreated)
 			return nil
-		case <-time.After(3 * time.Second):
+		case <-time.After(1 * time.Second):
+			<-ctx.Done()
 			c.Response().WriteHeader(http.StatusRequestTimeout)
 			return nil
 		}
 	}
+	// }(taskjob)
+
 	// Render success.
 	defer func() {
+		cancelFunc()
 		if x := recover(); x != nil {
 			log.Printf("[%v] caught panic :%v", c.Request().RemoteAddress(), x)
 		}
@@ -189,15 +272,20 @@ func main() {
 		ch               = make(chan bool)
 	)
 	flag.Parse()
+	runned = false
 
 	client := initClient(*maxRedisPoolSize)
 	defer client.Close()
 	go handleSignal(ch)
-	go teller(client)
+	// go teller(client)
+	// fmt.Println(time.Now())
+	startTime = time.Now().UnixNano()
 	// create job channel
 	jobCh := make(chan job, *maxQueueSize)
 	// create workers
 	var wg sync.WaitGroup
+	*maxWorkers = runtime.NumCPU()
+	fmt.Println(*maxWorkers)
 	for i := 0; i < *maxWorkers; i++ {
 		w := worker{i}
 		wg.Add(1)
@@ -205,7 +293,6 @@ func main() {
 			for j := range jobCh {
 				w.process(client, j)
 			}
-
 			defer wg.Done()
 		}(client, w, jobCh, &wg)
 	}
@@ -230,7 +317,7 @@ func main() {
 	})
 	// automatically add routers for net/http/pprof
 	// e.g. /debug/pprof, /debug/pprof/heap, etc.
-	//echopprof.Wrapper(e)
+	// echopprof.Wrapper(e)
 	go func() {
 		e.Run(fasthttp.WithConfig(cfg))
 	}()
